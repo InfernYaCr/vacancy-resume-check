@@ -88,7 +88,7 @@ def generate_markdown_report(results: List[Dict[str, Any]]) -> Optional[str]:
             icon = "🔴"
 
         lines = []
-        lines.append(f"### {index}. {icon} {name} (Оценка: {score}/100)")
+        lines.append(f"### {index}. {icon} ФИО: {name} (Оценка: {score}/100)")
         lines.append(f"**Вердикт:** {verdict}")
         lines.append(f"📄 **Файл:** {cand.get('resume_file', 'N/A')}")
         lines.append("")

@@ -78,7 +78,7 @@ You must return ONLY valid JSON. No markdown formatting (no ```json ... ```), no
 Structure:
 {
   "candidate_info": {
-    "name": "...",
+    "name": "Full Name (extract from resume header). If not found/hidden, use 'Не указано'. DO NOT use generic terms like 'Кандидат'.",
     "current_location": "...",
     "industry_background": "Main industry of previous jobs"
   },
