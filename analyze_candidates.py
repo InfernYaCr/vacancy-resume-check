@@ -52,7 +52,7 @@ async def get_llm_analysis(
         for attempt in range(max_retries):
             try:
                 # logger.debug(f"Попытка {attempt+1}/{max_retries}...")
-                
+
                 response = await client.chat.completions.create(
                     model=config.LLM_MODEL,
                     temperature=config.LLM_TEMPERATURE,
@@ -76,7 +76,9 @@ async def get_llm_analysis(
 
                 try:
                     # Валидация через Pydantic
-                    analysis_data = CandidateAnalysis.model_validate_json(cleaned_content)
+                    analysis_data = CandidateAnalysis.model_validate_json(
+                        cleaned_content
+                    )
                     return analysis_data.model_dump()
                 except ValidationError as e:
                     logger.error(f"Ошибка валидации Pydantic: {e}")
@@ -155,7 +157,7 @@ async def process_pair(
         # Обогащение метаданными
         analysis["vacancy_file"] = os.path.basename(vacancy_path)
         analysis["resume_file"] = resume_filename
-        
+
         score = analysis.get("scoring", {}).get("total_score", "N/A")
         logger.info(f"✅ Готово: {resume_filename} (Score: {score})")
         return analysis
@@ -173,7 +175,7 @@ async def process_batch_async(
     for vacancy_path in vacancies:
         logger.info(f"--- Подготовка вакансии: {os.path.basename(vacancy_path)} ---")
         vacancy_text = extract_text_from_mhtml(vacancy_path)
-        
+
         if not vacancy_text:
             logger.error(f"Пропуск вакансии {vacancy_path} (нет текста)")
             continue
@@ -186,7 +188,7 @@ async def process_batch_async(
 
     logger.info(f"Запуск {len(tasks)} задач анализа параллельно...")
     results = await asyncio.gather(*tasks)
-    
+
     # Фильтрация успешных результатов (удаляем None)
     valid_results = [r for r in results if r is not None]
     return valid_results
@@ -223,9 +225,9 @@ async def async_main():
         return
 
     start_time = time.time()
-    
+
     results = await process_batch_async(vacancies, resumes)
-    
+
     duration = time.time() - start_time
     logger.info(f"\n=== Обработка завершена за {duration:.2f} сек. ===")
     logger.info(f"Успешно обработано: {len(results)}")

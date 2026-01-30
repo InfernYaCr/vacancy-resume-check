@@ -147,8 +147,18 @@ class MHTMLParser:
         """Удаляет скрипты, стили и мусорные элементы из Soup (in-place)."""
         # Стандартная очистка
         tags_to_decompose = [
-            "script", "style", "meta", "noscript", "iframe", "svg",
-            "path", "defs", "symbol", "link", "object", "embed"
+            "script",
+            "style",
+            "meta",
+            "noscript",
+            "iframe",
+            "svg",
+            "path",
+            "defs",
+            "symbol",
+            "link",
+            "object",
+            "embed",
         ]
         for tag in soup(tags_to_decompose):
             tag.decompose()
@@ -238,14 +248,14 @@ class MHTMLParser:
             ("div", "resume-wrapper"),
             ("div", "main-content"),
         ]
-        
+
         for name, cls in main_zones_selectors:
             zone = soup.find(name, class_=cls)
             if zone:
                 target = zone
                 break
         else:
-             # Fallback
+            # Fallback
             app_zone = soup.find(id="app")
             if app_zone:
                 target = app_zone
