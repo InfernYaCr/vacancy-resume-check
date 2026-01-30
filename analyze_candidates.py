@@ -1,15 +1,17 @@
-import os
+import asyncio
 import json
-import time
-import traceback
 import logging
-from typing import List, Optional, Dict, Any, Tuple
-from openai import OpenAI, RateLimitError, APIError
-from pydantic import BaseModel, Field, ValidationError
+import os
+import time
+from typing import List, Optional, Tuple, Dict, Any
+
+from openai import AsyncOpenAI, RateLimitError, APIError
+from pydantic import ValidationError
 
 from config import config
 from extract_mhtml import extract_text_from_mhtml
 from generate_report import generate_markdown_report
+from models import CandidateAnalysis
 
 # Настройка логирования
 logging.basicConfig(
@@ -17,82 +19,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Инициализация асинхронного LLM клиента
+client = AsyncOpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
 
-# --- Pydantic модели ---
-class CandidateInfo(BaseModel):
-    name: str = Field(description="Имя кандидата", default="Не указано")
-    current_location: str = Field(
-        description="Текущий город проживания", default="Не указано"
-    )
-    industry_background: str = Field(
-        description="Основной опыт в индустрии", default="Не указано"
-    )
+# Семафор для ограничения одновременных запросов (чтобы не превысить Rate Limit)
+MAX_CONCURRENT_REQUESTS = 5
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 
-class ScoringBreakdown(BaseModel):
-    hard_skills: str = Field(description="Оценка Hard Skills (X/35)")
-    experience: str = Field(description="Оценка релевантности опыта (X/35)")
-    location: str = Field(description="Оценка локации (X/20)")
-    soft_skills_culture: str = Field(description="Оценка Soft Skills (X/10)")
-
-
-class Scoring(BaseModel):
-    total_score: int = Field(description="Общий балл 0-100")
-    breakdown: ScoringBreakdown
-
-
-class CandidateAnalysis(BaseModel):
-    candidate_info: CandidateInfo
-    scoring: Scoring
-    verdict: str = Field(description="Итоговый вердикт: Рекомендован, Резерв, Отказ")
-    location_logic: str = Field(description="Обоснование оценки локации")
-    pros: List[str] = Field(description="Список сильных сторон")
-    cons: List[str] = Field(description="Список слабых сторон/рисков")
-    red_flags: Optional[List[str]] = Field(
-        description="Список критических недостатков", default=None
-    )
-    reasoning_chain: str = Field(description="Краткое обоснование")
-
-
-# Инициализация LLM клиента
-client = OpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
-
-
-def smart_sleep(seconds: float) -> None:
-    """Обертка для sleep, чтобы было проще мокать или улучшать."""
-    logger.info(f"    Ожидание {seconds} сек для соблюдения лимитов API...")
-    time.sleep(seconds)
-
-
-def get_llm_analysis(
+async def get_llm_analysis(
     resume_text: str, vacancy_text: str, prompt_template_name: str = "hr_expert_v2.txt"
 ) -> Optional[Dict[str, Any]]:
     """
-    Отправляет запрос в LLM и возвращает разобранный JSON, валидированный через Pydantic.
-    Обрабатывает лимиты запросов (429) с экспоненциальной задержкой.
+    Асинхронно отправляет запрос в LLM и возвращает анализ кандидата.
     """
     max_retries = 5
     base_delay = 5
 
     try:
+        # Загрузка промпта (синхронная операция, но быстрая)
         prompt_template = config.load_prompt(prompt_template_name)
+    except FileNotFoundError:
+        logger.error(f"Шаблон промпта {prompt_template_name} не найден.")
+        return None
 
-        # Обрезаем текст, чтобы избежать лимитов токенов (базовая защита)
-        final_prompt = prompt_template.replace(
-            "{resume_text}", resume_text[:20000]
-        ).replace("{vacancy_text}", vacancy_text[:10000])
+    # Подготовка промпта
+    final_prompt = prompt_template.replace(
+        "{resume_text}", resume_text[:25000]
+    ).replace("{vacancy_text}", vacancy_text[:15000])
 
-        logger.debug(
-            f"Промпт подготовлен. Длина резюме: {len(resume_text)}, Длина вакансии: {len(vacancy_text)}"
-        )
-
+    async with semaphore:  # Ограничение одновременных вызовов
         for attempt in range(max_retries):
             try:
-                logger.info(
-                    f"    Попытка {attempt+1}/{max_retries}. Отправка запроса к {config.LLM_MODEL}..."
-                )
-
-                response = client.chat.completions.create(
+                # logger.debug(f"Попытка {attempt+1}/{max_retries}...")
+                
+                response = await client.chat.completions.create(
                     model=config.LLM_MODEL,
                     temperature=config.LLM_TEMPERATURE,
                     messages=[
@@ -110,48 +71,53 @@ def get_llm_analysis(
                     logger.warning("Получен пустой ответ от LLM")
                     return None
 
-                # Очистка markdown обертки, если есть
-                if content.startswith("```"):
-                    content = content.strip("`").strip()
-                    if content.startswith("json"):
-                        content = content[4:].strip()
+                # Очистка markdown блоков ```json ... ```
+                cleaned_content = _clean_json_content(content)
 
                 try:
-                    # Строгая валидация Pydantic
-                    analysis_data = CandidateAnalysis.model_validate_json(content)
+                    # Валидация через Pydantic
+                    analysis_data = CandidateAnalysis.model_validate_json(cleaned_content)
                     return analysis_data.model_dump()
                 except ValidationError as e:
-                    logger.error(f"Ошибка валидации Pydantic:\n{e}")
+                    logger.error(f"Ошибка валидации Pydantic: {e}")
                     return None
                 except json.JSONDecodeError:
-                    logger.error(
-                        f"Ошибка парсинга JSON. Фрагмент ответа LLM:\n{content[:200]}..."
-                    )
+                    logger.error(f"Ошибка парсинга JSON: {cleaned_content[:100]}...")
                     return None
 
             except RateLimitError:
                 wait_time = base_delay * (2**attempt)
-                logger.warning(f"Превышен лимит (429). Ожидание {wait_time} сек...")
-                time.sleep(wait_time)
+                logger.warning(f"RateLimit (429). Ждем {wait_time} сек...")
+                await asyncio.sleep(wait_time)
             except APIError as e:
-                # Специальная обработка для OpenRouter 429
+                # Обработка 429 от OpenRouter или других провайдеров
                 if getattr(e, "code", None) == 429:
                     wait_time = base_delay * (2**attempt)
-                    logger.warning(f"APIError 429. Ожидание {wait_time} сек...")
-                    time.sleep(wait_time)
+                    logger.warning(f"API 429. Ждем {wait_time} сек...")
+                    await asyncio.sleep(wait_time)
                 else:
+                    logger.error(f"API Error: {e}")
                     raise e
+            except Exception as e:
+                logger.error(f"Непредвиденная ошибка API: {e}")
+                return None
 
-        logger.error("Не удалось получить ответ после всех попыток")
-        return None
+    logger.error("Не удалось получить ответ после всех попыток")
+    return None
 
-    except Exception as e:
-        logger.error(f"Ошибка взаимодействия с LLM: {e}", exc_info=True)
-        return None
+
+def _clean_json_content(content: str) -> str:
+    """Удаляет markdown обертки из JSON строки."""
+    content = content.strip()
+    if content.startswith("```"):
+        content = content.strip("`")
+        if content.startswith("json"):
+            content = content[4:]
+    return content.strip()
 
 
 def get_candidate_files(work_dir: str) -> Tuple[List[str], List[str]]:
-    """Сканирует директорию и разделяет вакансии и резюме по ключевым словам."""
+    """Сканирует директорию и разделяет вакансии и резюме."""
     if not os.path.exists(work_dir):
         logger.error(f"Директория {work_dir} не найдена.")
         return [], []
@@ -162,56 +128,72 @@ def get_candidate_files(work_dir: str) -> Tuple[List[str], List[str]]:
 
     for f in files:
         full_path = os.path.join(work_dir, f)
-        # Улучшение: В реальной системе стоит проверять контент, но пока следуем архитектуре
         if config.VACANCY_KEYWORD.lower() in f.lower():
             vacancies.append(full_path)
         else:
             resumes.append(full_path)
 
-    logger.info(f"Найдено вакансий: {len(vacancies)}, резюме: {len(resumes)}.")
+    logger.info(f"Найдено: Вакансий={len(vacancies)}, Резюме={len(resumes)}.")
     return vacancies, resumes
 
 
-def process_batch(vacancies: List[str], resumes: List[str]) -> List[Dict[str, Any]]:
-    """Запускает анализ для всех комбинаций вакансий и резюме."""
-    results = []
+async def process_pair(
+    resume_path: str, vacancy_path: str, vacancy_text: str
+) -> Optional[Dict[str, Any]]:
+    """Обрабатывает одну пару (Резюме, Вакансия)."""
+    resume_filename = os.path.basename(resume_path)
+    logger.info(f"Начало анализа: {resume_filename}")
+
+    resume_text = extract_text_from_mhtml(resume_path)
+    if not resume_text:
+        logger.error(f"Не удалось извлечь текст из {resume_filename}")
+        return None
+
+    analysis = await get_llm_analysis(resume_text, vacancy_text)
+
+    if analysis:
+        # Обогащение метаданными
+        analysis["vacancy_file"] = os.path.basename(vacancy_path)
+        analysis["resume_file"] = resume_filename
+        
+        score = analysis.get("scoring", {}).get("total_score", "N/A")
+        logger.info(f"✅ Готово: {resume_filename} (Score: {score})")
+        return analysis
+    else:
+        logger.warning(f"❌ Провал: {resume_filename}")
+        return None
+
+
+async def process_batch_async(
+    vacancies: List[str], resumes: List[str]
+) -> List[Dict[str, Any]]:
+    """Параллельный запуск анализа для всех комбинаций."""
+    tasks = []
 
     for vacancy_path in vacancies:
-        logger.info(f"\n--- Анализ вакансии: {os.path.basename(vacancy_path)} ---")
+        logger.info(f"--- Подготовка вакансии: {os.path.basename(vacancy_path)} ---")
         vacancy_text = extract_text_from_mhtml(vacancy_path)
-
+        
         if not vacancy_text:
-            logger.error("Не удалось извлечь текст из вакансии.")
+            logger.error(f"Пропуск вакансии {vacancy_path} (нет текста)")
             continue
 
         for resume_path in resumes:
-            logger.info(f"  > Обработка кандидата: {os.path.basename(resume_path)}...")
-            resume_text = extract_text_from_mhtml(resume_path)
+            task = asyncio.create_task(
+                process_pair(resume_path, vacancy_path, vacancy_text)
+            )
+            tasks.append(task)
 
-            if not resume_text:
-                logger.error("    Не удалось извлечь текст из резюме.")
-                continue
-
-            analysis = get_llm_analysis(resume_text, vacancy_text)
-
-            if analysis:
-                # Обогащение метаданными
-                analysis["vacancy_file"] = os.path.basename(vacancy_path)
-                analysis["resume_file"] = os.path.basename(resume_path)
-                results.append(analysis)
-
-                score = analysis.get("scoring", {}).get("total_score", "N/A")
-                logger.info(f"    Анализ завершен. Оценка: {score}")
-            else:
-                logger.warning("    Анализ не удался (LLM вернула None).")
-
-            smart_sleep(5)  # Задержка
-
-    return results
+    logger.info(f"Запуск {len(tasks)} задач анализа параллельно...")
+    results = await asyncio.gather(*tasks)
+    
+    # Фильтрация успешных результатов (удаляем None)
+    valid_results = [r for r in results if r is not None]
+    return valid_results
 
 
 def save_results(results: List[Dict[str, Any]], reports_dir: str = "reports") -> None:
-    """Сохраняет сырые JSON результаты и генерирует Markdown отчет."""
+    """Сохраняет результаты и генерирует отчет."""
     if not os.path.exists(reports_dir):
         os.makedirs(reports_dir)
 
@@ -221,37 +203,40 @@ def save_results(results: List[Dict[str, Any]], reports_dir: str = "reports") ->
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"\nГотово! Сырые результаты сохранены в {output_file}")
+    logger.info(f"\nРезультаты сохранены: {output_file}")
 
-    logger.info("Генерация Markdown отчета...")
+    logger.info("Генерация отчета...")
     report_content = generate_markdown_report(results)
     if report_content:
         report_filename = os.path.join(reports_dir, f"report_{timestamp}.md")
         with open(report_filename, "w", encoding="utf-8") as f:
             f.write(report_content)
-        logger.info(f"Отчет успешно создан: {report_filename}")
+        logger.info(f"📄 Отчет создан: {report_filename}")
 
 
-def main():
+async def async_main():
     work_dir = "resume vs vacancy"
-
     vacancies, resumes = get_candidate_files(work_dir)
+
     if not vacancies or not resumes:
-        logger.warning(
-            "Недостаточно файлов для обработки. Проверьте папку 'resume vs vacancy'."
-        )
+        logger.warning("Нет файлов для обработки.")
         return
 
-    # Опционально: Раскомментируйте для теста
-    # vacancies = vacancies[:1]
-    # resumes = resumes[:1]
-
-    results = process_batch(vacancies, resumes)
+    start_time = time.time()
+    
+    results = await process_batch_async(vacancies, resumes)
+    
+    duration = time.time() - start_time
+    logger.info(f"\n=== Обработка завершена за {duration:.2f} сек. ===")
+    logger.info(f"Успешно обработано: {len(results)}")
 
     if results:
         save_results(results)
-    else:
-        logger.warning("Результаты не были сгенерированы.")
+
+
+def main():
+    """Точка входа для запуска через 'python analyze_candidates.py'"""
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":

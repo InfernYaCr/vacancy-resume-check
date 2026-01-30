@@ -21,7 +21,7 @@ build/
 reports/
 *.mhtml
 debug_content_dump.txt
-resume vs vacancy/
+# resume vs vacancy/ (Removed to allow folder tracking, content ignored by *.mhtml)
 
 # IDE
 .vscode/

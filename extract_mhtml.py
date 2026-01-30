@@ -1,11 +1,11 @@
 import email
-from bs4 import BeautifulSoup
-import chardet
-import os
-import re
-from markdownify import markdownify as md
-from typing import Optional, List, Union
 import logging
+import re
+from typing import List, Optional, Union
+
+import chardet
+from bs4 import BeautifulSoup
+from markdownify import markdownify as md
 
 # Настройка логирования
 logging.basicConfig(
@@ -19,43 +19,50 @@ class MHTMLParser:
     Парсит MHTML файлы для извлечения структурированного текста (Markdown) из резюме и вакансий.
     """
 
-    def __init__(self):
-        self.stop_phrases_exact = [
-            "Откликнуться",
-            "Показать контакты",
-            "Показать на большой карте",
-            "© Яндекс Условия использования",
-            "Оценка Dream Job",
-            "Рекомендуют работодателя",
-            "Все отзывы на Dream Job",
-            "Другие вакансии",
-            "Похожие вакансии",
-        ]
-        self.skip_sections = [
-            "Задайте вопрос работодателю",
-            "Чему можно научиться, пока вы в поиске",
-        ]
-        self.garbage_selectors = [
-            ".bloko-button",
-            ".resume-sidebar",
-            ".vacancy-sidebar",
-            ".supernova-overlay",
-            ".header",
-            ".footer",
-            ".bloko-modal",
-            ".cookie-warning",
-            ".navi",
-            ".top-menu",
-            "[data-qa='vacancy-response-section']",
-            ".vacancy-address-map",
-            ".vacancy-contacts__map",
-            ".recommended-vacancies",
-            ".similar-vacancies",
-        ]
+    STOP_PHRASES_EXACT: List[str] = [
+        "Откликнуться",
+        "Показать контакты",
+        "Показать на большой карте",
+        "© Яндекс Условия использования",
+        "Оценка Dream Job",
+        "Рекомендуют работодателя",
+        "Все отзывы на Dream Job",
+        "Другие вакансии",
+        "Похожие вакансии",
+    ]
+
+    SKIP_SECTIONS: List[str] = [
+        "Задайте вопрос работодателю",
+        "Чему можно научиться, пока вы в поиске",
+    ]
+
+    GARBAGE_SELECTORS: List[str] = [
+        ".bloko-button",
+        ".resume-sidebar",
+        ".vacancy-sidebar",
+        ".supernova-overlay",
+        ".header",
+        ".footer",
+        ".bloko-modal",
+        ".cookie-warning",
+        ".navi",
+        ".top-menu",
+        "[data-qa='vacancy-response-section']",
+        ".vacancy-address-map",
+        ".vacancy-contacts__map",
+        ".recommended-vacancies",
+        ".similar-vacancies",
+    ]
 
     def parse(self, file_path: str) -> Optional[str]:
         """
         Основная точка входа для парсинга MHTML файла.
+
+        Args:
+            file_path: Абсолютный путь к файлу .mhtml
+
+        Returns:
+            Optional[str]: Извлеченный текст в формате Markdown или None в случае ошибки.
         """
         try:
             html_content = self._read_and_decode(file_path)
@@ -84,27 +91,31 @@ class MHTMLParser:
             with open(file_path, "rb") as f:
                 msg = email.message_from_binary_file(f)
 
-            html_content = None
-            charset = None
+            html_content: Optional[bytes] = None
+            charset: Optional[str] = None
 
             if msg.is_multipart():
                 for part in msg.walk():
                     if part.get_content_type() == "text/html":
                         payload = part.get_payload(decode=True)
-                        if payload:
+                        if isinstance(payload, bytes):
                             html_content = payload
                             charset = part.get_content_charset()
                             break
             else:
                 if msg.get_content_type() == "text/html":
-                    html_content = msg.get_payload(decode=True)
-                    charset = msg.get_content_charset()
+                    payload = msg.get_payload(decode=True)
+                    if isinstance(payload, bytes):
+                        html_content = payload
+                        charset = msg.get_content_charset()
 
             if not html_content:
                 return None
 
             # Попытка декодирования
-            candidate_encodings = [charset] if charset else []
+            candidate_encodings = []
+            if charset:
+                candidate_encodings.append(charset)
             candidate_encodings.extend(["utf-8", "windows-1251"])
 
             for enc in candidate_encodings:
@@ -115,14 +126,14 @@ class MHTMLParser:
 
             # Fallback определение кодировки
             detected = chardet.detect(html_content)
-            encoding = detected["encoding"]
+            encoding = detected.get("encoding")
             if encoding:
                 try:
                     return html_content.decode(encoding)
                 except Exception:
                     pass
 
-            # Последняя попытка
+            # Последняя попытка с ignore errors
             try:
                 return html_content.decode("utf-8", errors="ignore")
             except Exception:
@@ -135,22 +146,11 @@ class MHTMLParser:
     def _clean_soup(self, soup: BeautifulSoup) -> None:
         """Удаляет скрипты, стили и мусорные элементы из Soup (in-place)."""
         # Стандартная очистка
-        for tag in soup(
-            [
-                "script",
-                "style",
-                "meta",
-                "noscript",
-                "iframe",
-                "svg",
-                "path",
-                "defs",
-                "symbol",
-                "link",
-                "object",
-                "embed",
-            ]
-        ):
+        tags_to_decompose = [
+            "script", "style", "meta", "noscript", "iframe", "svg",
+            "path", "defs", "symbol", "link", "object", "embed"
+        ]
+        for tag in soup(tags_to_decompose):
             tag.decompose()
 
         # Удаление навигации
@@ -159,14 +159,14 @@ class MHTMLParser:
                 tag.decompose()
 
         # Удаление мусора по CSS селекторам
-        full_selector = ", ".join(self.garbage_selectors)
+        full_selector = ", ".join(self.GARBAGE_SELECTORS)
         for tag in soup.select(full_selector):
             if tag.parent:
                 tag.decompose()
 
     def _parse_vacancy(self, soup: BeautifulSoup) -> str:
         """Парсинг структуры вакансии."""
-        parts = []
+        parts: List[str] = []
 
         # 1. Заголовок
         title_el = soup.find(attrs={"data-qa": "vacancy-title"}) or soup.find(
@@ -233,16 +233,22 @@ class MHTMLParser:
 
         # Изолируем основной контент
         target = soup
-        main_zones = [
-            soup.find("div", class_="resume-wrapper"),
-            soup.find("div", class_="main-content"),
-            soup.find(id="app"),
+        # Приоритетные зоны контента
+        main_zones_selectors = [
+            ("div", "resume-wrapper"),
+            ("div", "main-content"),
         ]
-
-        for zone in main_zones:
+        
+        for name, cls in main_zones_selectors:
+            zone = soup.find(name, class_=cls)
             if zone:
                 target = zone
                 break
+        else:
+             # Fallback
+            app_zone = soup.find(id="app")
+            if app_zone:
+                target = app_zone
 
         body_md = md(str(target), heading_style="ATX", strip=["img", "a"])
         return (resume_header_md + "\n\n" + body_md).strip()
@@ -250,7 +256,7 @@ class MHTMLParser:
     def _finalize_text(self, text: str) -> str:
         """Пост-обработка: очистка текста, удаление стоп-фраз и расстановка отступов."""
         lines = text.splitlines()
-        clean_lines = []
+        clean_lines: List[str] = []
         in_skip_section = False
 
         for line in lines:
@@ -268,7 +274,7 @@ class MHTMLParser:
 
             # 3. Стоп-фразы
             if any(
-                phrase.lower() in line_str.lower() for phrase in self.stop_phrases_exact
+                phrase.lower() in line_str.lower() for phrase in self.STOP_PHRASES_EXACT
             ):
                 continue
 
@@ -281,7 +287,7 @@ class MHTMLParser:
                 header_text_norm = re.sub(r"\s+", " ", header_text)
 
                 if any(
-                    s.lower() in header_text_norm.lower() for s in self.skip_sections
+                    s.lower() in header_text_norm.lower() for s in self.SKIP_SECTIONS
                 ):
                     in_skip_section = True
                 else:
@@ -299,28 +305,7 @@ class MHTMLParser:
         return "\n".join(clean_lines).strip()
 
 
-# Вспомогательная функция для обратной совместимости
+# Helper function for backward compatibility and simpler usage
 def extract_text_from_mhtml(file_path: str) -> Optional[str]:
     parser = MHTMLParser()
     return parser.parse(file_path)
-
-
-if __name__ == "__main__":
-    # Тестовый запуск
-    test_dir = "resume vs vacancy"
-    if os.path.exists(test_dir):
-        print(f"Тестирование в директории: {test_dir}")
-        for filename in os.listdir(test_dir):
-            if filename.lower().endswith(".mhtml"):
-                path = os.path.join(test_dir, filename)
-                print(f"--- Обработка {filename} ---")
-                text = extract_text_from_mhtml(path)
-                if text:
-                    print(f"Успех! Длина: {len(text)} символов")
-                    print(text[:200] + "...")
-                else:
-                    print("Не удалось извлечь текст.")
-    else:
-        print(
-            f"Тестовая директория '{test_dir}' не найдена. Пожалуйста, создайте её и добавьте .mhtml файлы."
-        )
