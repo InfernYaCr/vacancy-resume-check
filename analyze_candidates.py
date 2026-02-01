@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import logging
@@ -9,7 +10,8 @@ from openai import AsyncOpenAI, RateLimitError, APIError
 from pydantic import ValidationError
 
 from config import config
-from extract_mhtml import extract_text_from_mhtml
+from extract_mhtml import extract_text_from_mhtml, read_mhtml_file
+from hh_parser import HHParser
 from generate_report import generate_markdown_report
 from models import CandidateAnalysis
 
@@ -28,7 +30,7 @@ semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 
 async def get_llm_analysis(
-    resume_text: str, vacancy_text: str, prompt_template_name: str = "hr_expert_v2.txt"
+    prompt_data: Dict[str, str], prompt_template_name: str = "hr_expert_v2.txt"
 ) -> Optional[Dict[str, Any]]:
     """
     Асинхронно отправляет запрос в LLM и возвращает анализ кандидата.
@@ -44,9 +46,14 @@ async def get_llm_analysis(
         return None
 
     # Подготовка промпта
-    final_prompt = prompt_template.replace(
-        "{resume_text}", resume_text[:25000]
-    ).replace("{vacancy_text}", vacancy_text[:15000])
+    final_prompt = prompt_template
+    for key, value in prompt_data.items():
+        if value:
+            # Ограничение длины только для текстовых (не JSON), или для всех?
+            # JSON лучше не резать посередине.
+            # Для простоты пока не режем, или режем аккуратно.
+            # Если это JSON, то он может быть длинным.
+            final_prompt = final_prompt.replace(f"{{{key}}}", str(value))
 
     async with semaphore:  # Ограничение одновременных вызовов
         for attempt in range(max_retries):
@@ -140,18 +147,41 @@ def get_candidate_files(work_dir: str) -> Tuple[List[str], List[str]]:
 
 
 async def process_pair(
-    resume_path: str, vacancy_path: str, vacancy_text: str
+    resume_path: str, vacancy_path: str, vacancy_data: Any, parser_type: str, prompt_template: str
 ) -> Optional[Dict[str, Any]]:
     """Обрабатывает одну пару (Резюме, Вакансия)."""
     resume_filename = os.path.basename(resume_path)
     logger.info(f"Начало анализа: {resume_filename}")
 
-    resume_text = extract_text_from_mhtml(resume_path)
-    if not resume_text:
-        logger.error(f"Не удалось извлечь текст из {resume_filename}")
-        return None
+    prompt_data = {}
 
-    analysis = await get_llm_analysis(resume_text, vacancy_text)
+    if parser_type == "new":
+        # Используем HHParser (JSON)
+        # vacancy_data уже должен быть dict или json string
+        content = read_mhtml_file(resume_path)
+        if not content:
+            logger.error(f"Не удалось прочитать файл {resume_filename}")
+            return None
+            
+        parser = HHParser()
+        resume_json_obj = parser.parse(content)
+        
+        # Подготовка данных для промпта
+        # vacancy_data передается как dict, если parser_type=new
+        prompt_data["resume_json"] = json.dumps(resume_json_obj, ensure_ascii=False, indent=2)
+        prompt_data["vacancy_json"] = json.dumps(vacancy_data, ensure_ascii=False, indent=2)
+        
+    else:
+        # Используем Old Parser (Markdown)
+        resume_text = extract_text_from_mhtml(resume_path)
+        if not resume_text:
+             logger.error(f"Не удалось извлечь текст из {resume_filename}")
+             return None
+             
+        prompt_data["resume_text"] = resume_text
+        prompt_data["vacancy_text"] = vacancy_data # vacancy_data здесь string
+
+    analysis = await get_llm_analysis(prompt_data, prompt_template_name=prompt_template)
 
     if analysis:
         # Обогащение метаданными
@@ -167,22 +197,30 @@ async def process_pair(
 
 
 async def process_batch_async(
-    vacancies: List[str], resumes: List[str]
+    vacancies: List[str], resumes: List[str], parser_type: str, prompt_template: str
 ) -> List[Dict[str, Any]]:
     """Параллельный запуск анализа для всех комбинаций."""
     tasks = []
 
     for vacancy_path in vacancies:
         logger.info(f"--- Подготовка вакансии: {os.path.basename(vacancy_path)} ---")
-        vacancy_text = extract_text_from_mhtml(vacancy_path)
+        
+        vacancy_data = None
+        if parser_type == "new":
+            content = read_mhtml_file(vacancy_path)
+            if content:
+                parser = HHParser()
+                vacancy_data = parser.parse(content)
+        else:
+            vacancy_data = extract_text_from_mhtml(vacancy_path)
 
-        if not vacancy_text:
-            logger.error(f"Пропуск вакансии {vacancy_path} (нет текста)")
+        if not vacancy_data:
+            logger.error(f"Пропуск вакансии {vacancy_path} (нет данных)")
             continue
 
         for resume_path in resumes:
             task = asyncio.create_task(
-                process_pair(resume_path, vacancy_path, vacancy_text)
+                process_pair(resume_path, vacancy_path, vacancy_data, parser_type, prompt_template)
             )
             tasks.append(task)
 
@@ -217,6 +255,19 @@ def save_results(results: List[Dict[str, Any]], reports_dir: str = "reports") ->
 
 
 async def async_main():
+    parser = argparse.ArgumentParser(description="AI Recruitment Assistant")
+    parser.add_argument("--parser", choices=["old", "new"], default="new", help="Type of parser to use (old=text, new=json)")
+    parser.add_argument("--prompt", default=None, help="Prompt template filename (defaults to hr_expert_json.txt for new, hr_expert_legacy_markdown.txt for old)")
+    
+    args = parser.parse_args()
+    
+    # Auto-select prompt if not provided
+    if args.prompt is None:
+        if args.parser == "new":
+            args.prompt = "hr_expert_json.txt"
+        else:
+            args.prompt = "hr_expert_legacy_markdown.txt"
+    
     work_dir = "resume vs vacancy"
     vacancies, resumes = get_candidate_files(work_dir)
 
@@ -224,9 +275,10 @@ async def async_main():
         logger.warning("Нет файлов для обработки.")
         return
 
+    logger.info(f"Запуск анализа. Парсер: {args.parser}, Промпт: {args.prompt}")
     start_time = time.time()
 
-    results = await process_batch_async(vacancies, resumes)
+    results = await process_batch_async(vacancies, resumes, args.parser, args.prompt)
 
     duration = time.time() - start_time
     logger.info(f"\n=== Обработка завершена за {duration:.2f} сек. ===")

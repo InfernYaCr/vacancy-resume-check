@@ -319,3 +319,8 @@ class MHTMLParser:
 def extract_text_from_mhtml(file_path: str) -> Optional[str]:
     parser = MHTMLParser()
     return parser.parse(file_path)
+
+def read_mhtml_file(file_path: str) -> Optional[str]:
+    """Reads and decodes MHTML/HTML file content safely."""
+    parser = MHTMLParser()
+    return parser._read_and_decode(file_path)
